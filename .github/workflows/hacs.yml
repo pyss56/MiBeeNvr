@@ -14,6 +14,12 @@ permissions:
 
 jobs:
   validate:
+    # Fork-local guard: HACS inclusion is an upstream (Mi-Bee-Studio) goal, and
+    # the validator hard-fails on repository settings the fork deliberately does
+    # not mirror (Issues enabled, repository topics defined). Running it only
+    # where the hacs/default listing is actually submitted keeps the fork's
+    # Actions green without skipping any check upstream relies on.
+    if: github.repository == 'Mi-Bee-Studio/MiBeeNvr'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
