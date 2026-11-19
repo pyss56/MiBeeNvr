@@ -687,21 +687,26 @@ cameras:
 
 ```yaml
 xiaomi:
-  enabled: true
   user_id: "123456789"
   token: "your_passToken_here"
   region: "cn"
-  
-  # 性能优化
-  connection_timeout: "20s"    # 更快的超时
-  read_timeout: "45s"        # 根据网络条件调整
-  retry_attempts: 2          # 较少重试
-  retry_delay: "5s"          # 更快的重试
-  
-  # 内存管理
-  max_concurrent_cameras: 5   # 限制并发连接数
-  segment_buffer_size: "5MB" # 受限 RAM 使用较小缓冲区
+
+  # 传输层调优（全部可选；省略或填 0 表示用内置默认值）
+  connection_timeout: "5s"    # P2P 握手 + TCP 拨号预算（默认 5s）
+  read_timeout: "15s"         # 单次读包/命令等待上限（默认 15s）
+  idle_timeout: "30s"         # 无数据多久判定断链（默认 30s）
+  retry_attempts: 5           # 连续失败几次后转 ~60s 长退避（默认 5）
+  retry_delay: "0s"           # 固定重连间隔；0 = 1s/5s/10s/60s 分级退避
 ```
+
+说明：
+
+- 每台小米摄像头各自有独立 recorder，没有全局并发上限可配，因此
+  `max_concurrent_cameras` / `segment_buffer_size` 并不存在；录制缓冲区大小由
+  `storage.segment_duration` 与 recorder 自身的分段预算决定。
+- 弱网环境可把 `connection_timeout` 提到 `"20s"`、`retry_delay` 设为 `"20s"`，
+  给 P2P 打洞更多时间并避开 1s 重试风暴；调小 `idle_timeout` 能让死连接更快回收，
+  但 Wi-Fi 抖动时容易误判掉线。
 
 ## 故障排除
 

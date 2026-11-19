@@ -1,5 +1,7 @@
 package config
 
+import "time"
+
 // Package-level camera configuration types. See config.go for the
 // top-level Config aggregate and Validate/ApplyDefaults entry points.
 
@@ -439,9 +441,30 @@ type HealthOverrides struct {
 	FreezeTimeout          string  `yaml:"freeze_timeout,omitempty"`
 }
 
-// XiaomiConfig holds Xiaomi cloud authentication settings.
+// XiaomiConfig holds Xiaomi cloud authentication settings and the
+// transport-level tuning of the Xiaomi recorder (CS2/TUTK).
+//
+// The tuning keys were documented in docs/{zh,en}/xiaomi-setup.md long before
+// they existed in this struct. The YAML decoder is not strict, so they were
+// silently dropped: users "tuned" the connection and nothing changed. They now
+// map onto the recorder connect path:
+//
+//	connection_timeout -> CS2 P2P handshake + TCP dial budget
+//	read_timeout       -> wait for one media packet / command response
+//	idle_timeout       -> no-data window before the session is torn down
+//	retry_attempts     -> consecutive failures before the ~60s long backoff
+//	retry_delay        -> fixed reconnect interval (0 = tiered 1s/5s/10s/60s)
+//
+// Zero means "built-in default", so an untouched config keeps the historical
+// behaviour. Durations accept Go syntax ("20s", "1500ms").
 type XiaomiConfig struct {
 	UserID string `yaml:"user_id"` // Xiaomi account user ID (from auth response)
 	Token  string `yaml:"token"`   // Xiaomi passToken for API access
 	Region string `yaml:"region"`  // Region code (e.g. "cn", "sg", "de")
+
+	ConnectionTimeout time.Duration `yaml:"connection_timeout,omitempty"` // default 5s
+	ReadTimeout       time.Duration `yaml:"read_timeout,omitempty"`       // default 15s
+	IdleTimeout       time.Duration `yaml:"idle_timeout,omitempty"`       // default 30s
+	RetryAttempts     int           `yaml:"retry_attempts,omitempty"`     // default 5
+	RetryDelay        time.Duration `yaml:"retry_delay,omitempty"`        // default 0 (tiered)
 }

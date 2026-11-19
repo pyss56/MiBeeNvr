@@ -23,10 +23,44 @@ import (
 
 var cs2Logger = slogx.Component("xiaomi-cs2")
 
+// LinkOptions carries the transport-level timeouts of one Xiaomi (MISS/CS2)
+// session. Zero fields keep the built-in defaults, so a caller with nothing to
+// override passes LinkOptions{}.
+//
+// These are the knobs behind the yaml block `xiaomi:` — connection_timeout,
+// read_timeout and idle_timeout. They were documented for a long time while
+// being hardcoded here; see config.XiaomiConfig.
+type LinkOptions struct {
+	// ConnectTimeout bounds the P2P handshake (LAN search + punch + rdy) and
+	// the TCP dial that may follow it. 0 = cs2ConnectTimeout.
+	ConnectTimeout time.Duration
+	// ReadTimeout bounds a single ReadPacket/ReadCommand wait. 0 = cs2ReadTimeout.
+	ReadTimeout time.Duration
+	// IdleTimeout is how long a session may see no inbound data before the
+	// worker tears it down. 0 = defaultIdleTimeout.
+	IdleTimeout time.Duration
+}
+
+// withDefaults fills the zero fields with the historical constants.
+func (o LinkOptions) withDefaults() LinkOptions {
+	if o.ConnectTimeout <= 0 {
+		o.ConnectTimeout = cs2ConnectTimeout
+	}
+	if o.ReadTimeout <= 0 {
+		o.ReadTimeout = cs2ReadTimeout
+	}
+	if o.IdleTimeout <= 0 {
+		o.IdleTimeout = defaultIdleTimeout
+	}
+	return o
+}
+
 // CS2Dial establishes a CS2 P2P connection to a Xiaomi device.
 // transport: "udp" (default), "tcp", or "" (tries both).
-func CS2Dial(host, transport string, idleTimeout time.Duration) (*CS2Conn, error) {
-	conn, err := cs2Handshake(host, transport)
+func CS2Dial(host, transport string, opts LinkOptions) (*CS2Conn, error) {
+	opts = opts.withDefaults()
+
+	conn, err := cs2Handshake(host, transport, opts.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -39,11 +73,8 @@ func CS2Dial(host, transport string, idleTimeout time.Duration) (*CS2Conn, error
 		channels: [4]*cs2DataChannel{
 			newCS2DataChannel(0, 10), nil, newCS2DataChannel(250, 100), nil,
 		},
-	}
-	if idleTimeout == 0 {
-		c.idleTimeout = defaultIdleTimeout
-	} else {
-		c.idleTimeout = idleTimeout
+		idleTimeout: opts.IdleTimeout,
+		readTimeout: opts.ReadTimeout,
 	}
 	c.pingInterval = cs2PingInterval
 	go c.worker()
@@ -71,6 +102,10 @@ type CS2Conn struct {
 	net.Conn
 	isTCP       bool
 	idleTimeout time.Duration
+	// readTimeout bounds a single ReadPacket/ReadCommand wait. Set by CS2Dial
+	// from LinkOptions.ReadTimeout; 0 falls back to cs2ReadTimeout so tests
+	// that build a CS2Conn by hand keep working.
+	readTimeout time.Duration
 	// pingInterval is the client PING cadence on TCP sessions; see
 	// cs2PingInterval. Worker-goroutine only. Set by CS2Dial; tests may
 	// override it to keep the cadence observable without real sleeps.
@@ -145,6 +180,12 @@ const cs2HdrSize = 32
 // If no data arrives within this period, the call returns a timeout error.
 const cs2ReadTimeout = 15 * time.Second
 
+// cs2ConnectTimeout is the handshake budget (LAN search + punch + rdy) and the
+// ceiling for the TCP dial that may follow. Historically the handshake deadline
+// was 5s and the dial 3s; one knob now covers both, so a widening user setting
+// (`xiaomi.connection_timeout`) is not silently capped at the dial.
+const cs2ConnectTimeout = 5 * time.Second
+
 // cs2PingInterval is the client PING cadence on CS2 TCP sessions. Xiaomi
 // cameras expect the client to PING roughly once per second (observed from
 // the official Mi Home app; go2rtc parity) and tear the session down after
@@ -179,13 +220,16 @@ func (p *cs2PingPolicy) due(now time.Time) bool { return !now.Before(p.next) }
 // markSent records a PING sent at instant now, scheduling the next one.
 func (p *cs2PingPolicy) markSent(now time.Time) { p.next = now.Add(p.interval) }
 
-func cs2Handshake(host, transport string) (net.Conn, error) {
+func cs2Handshake(host, transport string, connectTimeout time.Duration) (net.Conn, error) {
+	if connectTimeout <= 0 {
+		connectTimeout = cs2ConnectTimeout
+	}
 	conn, err := cs2NewUDPConn(host, 32108)
 	if err != nil {
 		return nil, err
 	}
 
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(connectTimeout))
 
 	req := []byte{cs2Magic, cs2MsgLanSearch, 0, 0}
 	res, err := conn.(*cs2UDPConn).WriteUntil(req, func(res []byte) bool {
@@ -217,7 +261,7 @@ func cs2Handshake(host, transport string) (net.Conn, error) {
 
 	if res[1] == msgTCP {
 		_ = conn.Close()
-		return cs2NewTCPConn(conn.RemoteAddr().String())
+		return cs2NewTCPConn(conn.RemoteAddr().String(), connectTimeout)
 	}
 
 	return conn, nil
@@ -450,14 +494,24 @@ func (c *CS2Conn) workerExitGuard() {
 	}
 }
 
+// readWait returns the per-call read budget, falling back to the historical
+// constant for connections built without CS2Dial (tests).
+func (c *CS2Conn) readWait() time.Duration {
+	if c.readTimeout > 0 {
+		return c.readTimeout
+	}
+	return cs2ReadTimeout
+}
+
 // ReadCommand reads a command response from channel 0.
 func (c *CS2Conn) ReadCommand() (cmd uint32, data []byte, err error) {
-	buf, ok := c.channels[0].Pop(cs2ReadTimeout)
+	wait := c.readWait()
+	buf, ok := c.channels[0].Pop(wait)
 	if !ok {
 		if c.getErr() != nil {
 			return 0, nil, c.getErr()
 		}
-		return 0, nil, fmt.Errorf("cs2: no command data for %v", cs2ReadTimeout)
+		return 0, nil, fmt.Errorf("cs2: no command data for %v", wait)
 	}
 	cmd = binary.LittleEndian.Uint32(buf)
 	data = buf[4:]
@@ -507,13 +561,14 @@ func (c *CS2Conn) WriteCommand(cmd uint32, data []byte) error {
 
 // ReadPacket reads a media packet from channel 2.
 func (c *CS2Conn) ReadPacket() (hdr, payload []byte, err error) {
+	wait := c.readWait()
 	for {
-		data, ok := c.channels[2].Pop(cs2ReadTimeout)
+		data, ok := c.channels[2].Pop(wait)
 		if !ok {
 			if c.getErr() != nil {
 				return nil, nil, c.getErr()
 			}
-			return nil, nil, fmt.Errorf("cs2: no media data for %v", cs2ReadTimeout)
+			return nil, nil, fmt.Errorf("cs2: no media data for %v", wait)
 		}
 		// Short-frame guard: some firmwares occasionally emit a channel-2
 		// frame smaller than the fixed 32-byte header — slicing
@@ -659,8 +714,11 @@ func (c *cs2UDPConn) WriteUntil(req []byte, ok func(res []byte) bool) ([]byte, e
 	}
 }
 
-func cs2NewTCPConn(addr string) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+func cs2NewTCPConn(addr string, connectTimeout time.Duration) (net.Conn, error) {
+	if connectTimeout <= 0 {
+		connectTimeout = cs2ConnectTimeout
+	}
+	conn, err := net.DialTimeout("tcp", addr, connectTimeout)
 	if err != nil {
 		return nil, err
 	}

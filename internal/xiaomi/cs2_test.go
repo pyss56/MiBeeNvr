@@ -734,7 +734,7 @@ func TestCS2WorkerAcceptsLargeTCPFrame(t *testing.T) {
 		<-popDone
 	}()
 
-	conn, err := cs2NewTCPConn(ln.Addr().String())
+	conn, err := cs2NewTCPConn(ln.Addr().String(), 0)
 	require.NoError(t, err)
 
 	c := &CS2Conn{

@@ -105,9 +105,16 @@ type XiaomiRecorderConfig struct {
 	ErrReporter       ErrorReporter     // Optional: reports detailed errors (e.g. TUTK incompatibility)
 	AudioEnabled      bool              // Capture and broadcast audio via StreamHub when true
 	AudioInRecordings bool              // Keep the audio track in recorded segments (default off)
-	IdleTimeout       time.Duration
-	Channel           string // Xiaomi dual-lens channel ("" or "0" = main, "1" = secondary)
-	Quality           string // Stream quality: "" or "auto" (HD→SD fallback), "hd", "sd"
+	// Transport tuning (config.XiaomiConfig.*). Zero = built-in default:
+	// ConnectTimeout 5s, ReadTimeout 15s, IdleTimeout 30s, RetryAttempts 5,
+	// RetryDelay 0 (tiered 1s/5s/10s/60s).
+	ConnectTimeout time.Duration // P2P handshake + TCP dial budget
+	ReadTimeout    time.Duration // single media packet / command wait
+	IdleTimeout    time.Duration // no-data window before the session is torn down
+	RetryAttempts  int           // consecutive failures before the ~60s long backoff
+	RetryDelay     time.Duration // fixed reconnect interval; 0 = tiered backoff
+	Channel        string        // Xiaomi dual-lens channel ("" or "0" = main, "1" = secondary)
+	Quality        string        // Stream quality: "" or "auto" (HD→SD fallback), "hd", "sd"
 	// MergeFriendly pins the stream quality for merge-consistent recordings:
 	// the SD→HD upgrade probe (issue #502 defect B) is disarmed, so quality
 	// flips — and the SPS/PPS boundaries they put between segments — collapse
@@ -325,8 +332,20 @@ func NewXiaomiRecorder(cfg XiaomiRecorderConfig, store SegmentStore, opts ...*me
 	if cfg.SegmentDur == 0 {
 		cfg.SegmentDur = defaultSegmentDur
 	}
-	if cfg.IdleTimeout == 0 {
+	if cfg.ConnectTimeout <= 0 {
+		cfg.ConnectTimeout = cs2ConnectTimeout
+	}
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = cs2ReadTimeout
+	}
+	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = defaultIdleTimeout
+	}
+	if cfg.RetryAttempts <= 0 {
+		cfg.RetryAttempts = connectFailThreshold
+	}
+	if cfg.RetryDelay < 0 {
+		cfg.RetryDelay = 0
 	}
 	return &XiaomiRecorder{
 		cfg:                 cfg,
@@ -495,14 +514,16 @@ func (r *XiaomiRecorder) reportVendorError(err error) {
 // network — issue #48. After connectFailThreshold consecutive failures, we set a
 // "connect_failed" detail so the frontend can show guidance ("check the camera is
 // online and on the same network") instead of a bare spinner.
+//
+// It is also the default for the `xiaomi.retry_attempts` knob (see
+// retryAttemptThreshold).
 const connectFailThreshold = 5
 
 func (r *XiaomiRecorder) reportConnectError(err error) {
 	if r.cfg.ErrReporter == nil || err == nil {
 		return
 	}
-	r.connectFailCount++
-	if r.connectFailCount < connectFailThreshold {
+	if r.connectFailCount < r.retryAttemptThreshold() {
 		return
 	}
 	// Extract the host being dialed from the MISS URL for the message.
@@ -591,7 +612,7 @@ func (r *XiaomiRecorder) run(ctx context.Context) {
 				return
 			}
 			retryCount++
-			delay := backoff.TieredBackoffWithJitter(retryCount)
+			delay := r.nextRetryDelay(retryCount)
 			r.reportVendorError(err)
 			xiaomiLogger.Error("failed to resolve MISS URL, retrying", "camera_id", r.cfg.CameraID, "error", err, "backoff", delay, "attempt", retryCount)
 			r.recordError("cloud_resolve")
@@ -641,11 +662,13 @@ func (r *XiaomiRecorder) run(ctx context.Context) {
 		// the user after the threshold (issue #48: "reconnecting" forever with no
 		// hint the camera is unreachable). Also lengthen the backoff once the
 		// failure is clearly persistent, to calm the retry storm.
+		//
+		// The counter is bumped here rather than inside reportConnectError so the
+		// backoff escalation (xiaomi.retry_attempts) keeps working when no
+		// ErrorReporter is wired.
+		r.connectFailCount++
 		r.reportConnectError(err)
-		delay := backoff.TieredBackoffWithJitter(retryCount)
-		if r.connectFailCount >= connectFailThreshold {
-			delay = backoff.StorageBackoffWithJitter() // ~60s — the camera isn't coming back soon
-		}
+		delay := r.nextRetryDelay(retryCount)
 		xiaomiLogger.Error("connection error, reconnecting", "camera_id", r.cfg.CameraID, "error", err, "backoff", delay, "attempt", retryCount, "connect_failures", r.connectFailCount)
 		r.recordError("connection")
 		r.recordXiaomiDisconnect(classifyDisconnectReason(err))
@@ -656,6 +679,33 @@ func (r *XiaomiRecorder) run(ctx context.Context) {
 		case <-time.After(delay):
 		}
 	}
+}
+
+// retryAttemptThreshold is the consecutive-failure count at which the reconnect
+// loop stops spending the short 1s/5s/10s delays and settles on the ~60s one.
+// Configured via `xiaomi.retry_attempts`; 0 falls back to the historical 5.
+func (r *XiaomiRecorder) retryAttemptThreshold() int {
+	if r.cfg.RetryAttempts > 0 {
+		return r.cfg.RetryAttempts
+	}
+	return connectFailThreshold
+}
+
+// nextRetryDelay returns the wait before the next connect attempt.
+//
+// `xiaomi.retry_delay` pins a fixed interval (e.g. "20s") and replaces the
+// tiered schedule entirely. Otherwise the tiered schedule applies
+// (1s/5s/10s/60s + jitter), escalating to the ~60s storage backoff once
+// connect failures reach RetryAttempts — the camera is clearly not coming back
+// within seconds, and hammering it just floods the log.
+func (r *XiaomiRecorder) nextRetryDelay(attempt int) time.Duration {
+	if r.cfg.RetryDelay > 0 {
+		return r.cfg.RetryDelay
+	}
+	if r.connectFailCount >= r.retryAttemptThreshold() {
+		return backoff.StorageBackoffWithJitter()
+	}
+	return backoff.TieredBackoffWithJitter(attempt)
 }
 
 // qualityAuto reports whether the auto HD↔SD state machine is armed (quality
@@ -753,7 +803,11 @@ func (r *XiaomiRecorder) connectAndRecord(ctx context.Context, missURL string) (
 	// Zero until StartMedia succeeds — a failed connect must not inherit the
 	// previous connection's stable-streaming window (issue #502).
 	r.mediaStart = time.Time{}
-	client, err := NewMISSClient(missURL, r.cfg.IdleTimeout)
+	client, err := NewMISSClientWithOptions(missURL, LinkOptions{
+		ConnectTimeout: r.cfg.ConnectTimeout,
+		ReadTimeout:    r.cfg.ReadTimeout,
+		IdleTimeout:    r.cfg.IdleTimeout,
+	})
 	if err != nil {
 		return fmt.Errorf("miss connect: %w", err), false
 	}

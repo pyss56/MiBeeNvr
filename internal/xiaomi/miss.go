@@ -111,7 +111,16 @@ func (p *MISSPacket) sampleRate() uint32 {
 
 // NewMISSClient parses a MISS URL, establishes a CS2 connection, and performs login.
 // URL format: miss://host?vendor=cs2&device_public=...&client_private=...&client_public=...&sign=...&model=...
+//
+// idleTimeout is kept for callers that only care about the session idle window;
+// NewMISSClientWithOptions covers the full transport tuning.
 func NewMISSClient(rawURL string, idleTimeout time.Duration) (*MISSClient, error) {
+	return NewMISSClientWithOptions(rawURL, LinkOptions{IdleTimeout: idleTimeout})
+}
+
+// NewMISSClientWithOptions is NewMISSClient with every transport timeout
+// exposed (the `xiaomi:` yaml knobs). Zero fields fall back to the defaults.
+func NewMISSClientWithOptions(rawURL string, opts LinkOptions) (*MISSClient, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
@@ -130,7 +139,7 @@ func NewMISSClient(rawURL string, idleTimeout time.Duration) (*MISSClient, error
 	var conn MISSConn
 	switch s := query.Get("vendor"); s {
 	case "cs2":
-		conn, err = CS2Dial(u.Host, query.Get("transport"), idleTimeout)
+		conn, err = CS2Dial(u.Host, query.Get("transport"), opts)
 	case "tutk":
 		conn, err = tutk.Dial(u.Host, query.Get("uid"), "Miss", "client")
 	default:

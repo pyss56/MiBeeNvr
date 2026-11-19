@@ -796,6 +796,26 @@ func validateConfigDetails(cfg *Config) error {
 		return fmt.Errorf("websocket.idle_timeout must be > 0, got %s", cfg.WebSocket.IdleTimeout)
 	}
 
+	// Validate Xiaomi transport tuning. Zero means "use the built-in default"
+	// and is rejected below only when negative, so a config that never touched
+	// these keys validates unchanged. The upper bounds catch unit mistakes
+	// (a bare `retry_delay: 5` parses as 5ns, not 5s).
+	if cfg.Xiaomi.ConnectionTimeout < 0 || cfg.Xiaomi.ConnectionTimeout > 5*time.Minute {
+		return fmt.Errorf("xiaomi.connection_timeout must be between 0 and 5m, got %s", cfg.Xiaomi.ConnectionTimeout)
+	}
+	if cfg.Xiaomi.ReadTimeout < 0 || cfg.Xiaomi.ReadTimeout > 5*time.Minute {
+		return fmt.Errorf("xiaomi.read_timeout must be between 0 and 5m, got %s", cfg.Xiaomi.ReadTimeout)
+	}
+	if cfg.Xiaomi.IdleTimeout < 0 || cfg.Xiaomi.IdleTimeout > time.Hour {
+		return fmt.Errorf("xiaomi.idle_timeout must be between 0 and 1h, got %s", cfg.Xiaomi.IdleTimeout)
+	}
+	if cfg.Xiaomi.RetryAttempts < 0 || cfg.Xiaomi.RetryAttempts > 100 {
+		return fmt.Errorf("xiaomi.retry_attempts must be between 0 and 100, got %d", cfg.Xiaomi.RetryAttempts)
+	}
+	if cfg.Xiaomi.RetryDelay < 0 || cfg.Xiaomi.RetryDelay > 10*time.Minute {
+		return fmt.Errorf("xiaomi.retry_delay must be between 0 and 10m, got %s", cfg.Xiaomi.RetryDelay)
+	}
+
 	// Validate SRT configuration
 	if cfg.SRT.Port < 1 || cfg.SRT.Port > 65535 {
 		return fmt.Errorf("srt.port must be between 1 and 65535, got %d", cfg.SRT.Port)

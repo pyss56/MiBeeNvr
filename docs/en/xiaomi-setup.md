@@ -672,21 +672,28 @@ cameras:
 
 ```yaml
 xiaomi:
-  enabled: true
   user_id: "123456789"
   token: "your_passToken_here"
   region: "cn"
-  
-  # Performance optimizations
-  connection_timeout: "20s"    # Faster timeout
-  read_timeout: "45s"        # Adjusted for network conditions
-  retry_attempts: 2          # Fewer retries
-  retry_delay: "5s"          # Faster retry
-  
-  # Memory management
-  max_concurrent_cameras: 5   # Limit concurrent connections
-  segment_buffer_size: "5MB" # Smaller buffer for limited RAM
+
+  # Transport tuning (all optional; omit or 0 to keep the built-in default).
+  connection_timeout: "5s"    # P2P handshake + TCP dial budget (default 5s)
+  read_timeout: "15s"         # Wait for one media packet / command (default 15s)
+  idle_timeout: "30s"         # Tear the session down after this much silence (default 30s)
+  retry_attempts: 5           # Consecutive failures before the ~60s backoff (default 5)
+  retry_delay: "0s"           # Fixed reconnect interval; 0 = 1s/5s/10s/60s tiered backoff
 ```
+
+Notes:
+
+- Every Xiaomi camera has its own recorder, so there is no global concurrency
+  cap to configure — `max_concurrent_cameras` and `segment_buffer_size` do not
+  exist. Recording buffer sizing follows `storage.segment_duration` and the
+  recorder's own segment budget.
+- On a weak link, raising `connection_timeout` to `"20s"` and `retry_delay` to
+  `"20s"` gives the P2P punch more time and stops the 1s retry burst; lowering
+  `idle_timeout` makes dead sessions drop faster but risks false positives on
+  jittery Wi-Fi.
 
 ## Troubleshooting
 

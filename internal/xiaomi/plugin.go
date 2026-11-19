@@ -35,13 +35,25 @@ func (p *XiaomiPlugin) Protocols() []string { return []string{"xiaomi"} }
 // cloudCfg stores the Xiaomi cloud credentials, set via SetCloudConfig.
 var cloudCfg XiaomiCloudConfig
 
-// SetCloudConfig stores the Xiaomi cloud credentials for use by recorders.
-// Must be called before any xiaomi recorder is created.
+// linkCfg stores the transport tuning from the `xiaomi:` block. Credentials are
+// kept separate (cloudCfg) so the post-sign-in path can refresh them without
+// wiping the startup-provided timeouts.
+var linkCfg config.XiaomiConfig
+
+// SetCloudConfig stores the Xiaomi cloud credentials and the transport tuning
+// for use by recorders. Must be called before any xiaomi recorder is created.
 func SetCloudConfig(cfg config.XiaomiConfig) {
+	SetCloudCredentials(cfg.UserID, cfg.Token, cfg.Region)
+	linkCfg = cfg
+}
+
+// SetCloudCredentials refreshes only the credentials (post sign-in / captcha),
+// leaving the transport tuning from SetCloudConfig intact.
+func SetCloudCredentials(userID, token, region string) {
 	cloudCfg = XiaomiCloudConfig{
-		UserID: cfg.UserID,
-		Token:  cfg.Token,
-		Region: cfg.Region,
+		UserID: userID,
+		Token:  token,
+		Region: region,
 	}
 }
 
@@ -66,6 +78,11 @@ func (p *XiaomiPlugin) NewRecorder(cfg config.CameraConfig, store *storage.Manag
 		HealthDB:          db, // quality-change health events (issue #502)
 		AudioEnabled:      cfg.AudioEnabled,
 		AudioInRecordings: cfg.AudioInRecordings,
+		ConnectTimeout:    linkCfg.ConnectionTimeout,
+		ReadTimeout:       linkCfg.ReadTimeout,
+		IdleTimeout:       linkCfg.IdleTimeout,
+		RetryAttempts:     linkCfg.RetryAttempts,
+		RetryDelay:        linkCfg.RetryDelay,
 		Channel:           cfg.Channel,
 		Quality:           cfg.Quality,
 		MergeFriendly:     cfg.MergeFriendly,

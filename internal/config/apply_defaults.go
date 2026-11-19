@@ -216,6 +216,23 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.Xiaomi.Region == "" {
 		cfg.Xiaomi.Region = "cn"
 	}
+	// Transport tuning. Zero keeps the recorder's historical hardcoded values;
+	// spelling them out here lets config.Save emit them and keeps the docs,
+	// the API and the recorder in sync. RetryDelay deliberately stays 0:
+	// 0 = tiered backoff (1s/5s/10s/60s), which is not a fixed interval.
+	if cfg.Xiaomi.ConnectionTimeout == 0 {
+		cfg.Xiaomi.ConnectionTimeout = 5 * time.Second
+	}
+	if cfg.Xiaomi.ReadTimeout == 0 {
+		cfg.Xiaomi.ReadTimeout = 15 * time.Second
+	}
+	if cfg.Xiaomi.IdleTimeout == 0 {
+		cfg.Xiaomi.IdleTimeout = 30 * time.Second
+	}
+	if cfg.Xiaomi.RetryAttempts == 0 {
+		cfg.Xiaomi.RetryAttempts = 5
+	}
+
 	// Observability
 	if strings.TrimSpace(cfg.Observability.LogLevel) == "" {
 		cfg.Observability.LogLevel = "info"

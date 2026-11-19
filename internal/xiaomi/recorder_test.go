@@ -945,16 +945,15 @@ func (m *mockErrReporter) SetErrorDetail(cameraID string, detail *model.CameraEr
 }
 
 // TestReportConnectError_BelowThreshold verifies no error detail is set before
-// the connectFailThreshold consecutive failures are reached.
+// the connectFailThreshold consecutive failures are reached. The counter is
+// maintained by run(), so the test seeds it.
 func TestReportConnectError_BelowThreshold(t *testing.T) {
 	t.Helper()
 	reporter := &mockErrReporter{}
 	r := &XiaomiRecorder{cfg: XiaomiRecorderConfig{CameraID: "cam-test", ErrReporter: reporter}}
-	for range connectFailThreshold - 1 {
-		r.reportConnectError(fmt.Errorf("miss connect: read udp i/o timeout"))
-	}
+	r.connectFailCount = connectFailThreshold - 1
+	r.reportConnectError(fmt.Errorf("miss connect: read udp i/o timeout"))
 	require.Nil(t, reporter.lastDetail, "no error detail should be set before threshold")
-	require.Equal(t, connectFailThreshold-1, r.connectFailCount)
 }
 
 // TestReportConnectError_AtThreshold verifies the error detail is set once the
@@ -966,13 +965,23 @@ func TestReportConnectError_AtThreshold(t *testing.T) {
 		cfg:         XiaomiRecorderConfig{CameraID: "cam-test", ErrReporter: reporter},
 		lastMissURL: "miss://192.168.31.251:1234",
 	}
-	for range connectFailThreshold {
-		r.reportConnectError(fmt.Errorf("miss connect: read udp i/o timeout"))
-	}
+	r.connectFailCount = connectFailThreshold
+	r.reportConnectError(fmt.Errorf("miss connect: read udp i/o timeout"))
 	require.NotNil(t, reporter.lastDetail, "error detail should be set at threshold")
 	require.Equal(t, "connect_failed", reporter.lastDetail.Type)
 	require.Contains(t, reporter.lastDetail.Message, "192.168.31.251")
 	require.Contains(t, reporter.lastDetail.Message, "Cannot reach the camera")
+}
+
+// TestReportConnectErrorDoesNotOwnCounter verifies the failure counter moved to
+// run(): reportConnectError returns early without a reporter, and the
+// retry_attempts escalation must not depend on one being wired.
+func TestReportConnectErrorDoesNotOwnCounter(t *testing.T) {
+	t.Helper()
+	r := &XiaomiRecorder{cfg: XiaomiRecorderConfig{CameraID: "cam-test", RetryAttempts: 1}}
+	r.reportConnectError(fmt.Errorf("miss connect: read udp i/o timeout"))
+	require.Zero(t, r.connectFailCount, "reporting must not own the counter")
+	require.Equal(t, 1, r.retryAttemptThreshold())
 }
 
 // TestClearConnectError verifies the counter resets and detail clears on success.
