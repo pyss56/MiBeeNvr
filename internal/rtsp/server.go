@@ -774,7 +774,7 @@ func (cs *cameraStream) buildMedia() (*description.Media, error) {
 // no G.711 audio — the SDP then stays video-only, exactly as before.
 func (cs *cameraStream) buildAudioMedia() (*description.Media, error) {
 	if cs.audioCodec != model.AudioG711 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // nil media = "no G.711 audio"; the caller keeps a video-only SDP
 	}
 	f := &format.G711{
 		MULaw:        cs.audioMULaw,
