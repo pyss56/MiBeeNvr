@@ -205,7 +205,7 @@ flowchart LR
 
 ### 7.1 概述
 
-音频从摄像头采集开始，经过两条并行路径（录制 + 实时预览）。支持 G.711 μ-law/A-law、AAC、Opus 编解码器。原始编码字节同时写入两条路径，不做转码，既保留了音质又最小化服务器 CPU 开销。
+音频从摄像头采集开始，经过三条并行路径（录制 + 实时预览 + RTSP 输出）。支持 G.711 μ-law/A-law、AAC、Opus 编解码器。原始编码字节同时写入各条路径，不做转码，既保留了音质又最小化服务器 CPU 开销。
 
 ### 7.2 编解码器检测
 
@@ -225,7 +225,7 @@ G.711 使用 `rtplpcm.Decoder`（返回原始 8-bit 字节，不做解压），A
 
 ### 7.3 双路径架构
 
-原始编码字节通过 StreamHub 同时写入两个消费者：
+原始编码字节通过 StreamHub 分发给所有实时消费者：
 
 1. **录制路径**：`muxer.WriteAudioSample()` → 原始字节存入 MP4 分片
    - MP4 box 类型：`ulaw`/`alaw`（G.711，8-bit sample size）、`mp4a`+`esds`（AAC）、`Opus`+`dOps`（Opus，48kHz timescale）
@@ -233,7 +233,9 @@ G.711 使用 `rtplpcm.Decoder`（返回原始 8-bit 字节，不做解压），A
 
 2. **实时预览路径**：`hub.BroadcastAudio()` → wsstream → WebSocket 二进制帧 → 前端 JS 解码
 
-**关键点**：相同的原始字节流向两条路径。音质差异来自解码器，而非数据本身。
+3. **RTSP 输出路径**：`hub.SubscribeAudio` → `rtplpcm.Encoder`（8-bit）→ 每个读者在 `trackID=1` 媒体上独立封包，声明为 PCMU（payload type 0）或 PCMA（payload type 8），8000 Hz 单声道。视频与音频时间戳来自同一路流的同一墙钟原点，拉流端（群晖 Surveillance Station 等）无需额外信令即可对齐两轨。只输出 G.711：Opus 需要按 48 kHz 重新声明而小米发的是 16 kHz；原始 PCM（MISS codec 1024）未做压扩，因此不输出。无 G.711 的相机仍保持纯视频 SDP。
+
+**关键点**：相同的原始字节流向每条路径。音质差异来自解码器，而非数据本身。
 
 ### 7.4 录制回放（清晰音频）
 

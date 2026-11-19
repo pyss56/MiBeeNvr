@@ -64,6 +64,15 @@ curl -u admin:password \
   -o audio-stream.aac
 ```
 
+## RTSP 输出
+
+带 G.711 音频的相机也会在内置 RTSP 输出服务上带出声音，第三方平台（群晖 Surveillance Station 等）取一路 RTSP 即可同时拿到画面与声音：
+
+- SDP 在视频媒体之外多一路音频媒体 `trackID=1`。
+- 编码：μ-law 相机为 PCMU（RFC 3551 静态 payload type 0），A-law 相机为 PCMA（payload type 8）——8000 Hz、单声道、不转码。律制按相机自动识别，无需配置。
+- 音频与视频的时间戳来自同一路流的同一墙钟原点，播放器无需额外信令即可对齐两轨。
+- 没有 G.711 音频的相机仍只输出视频；Opus 不通过 RTSP 输出。
+
 ## 双向对讲
 
 ### 启用对讲

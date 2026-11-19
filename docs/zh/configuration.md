@@ -159,7 +159,7 @@ version: "1.0"
 ### `server.rtsp.enabled` / `server.rtsp.port`
 - **类型**： bool / int
 - **默认**： `true` / `8554`
-- **说明**： 内置 RTSP 输出服务端——每路相机一个固定取流地址 `rtsp://<NVR-IP>:8554/<camera_id>`，第三方平台（如群晖 Surveillance Station）可直接填为摄像头源。H.264/H.265 原生输出（无转码、仅视频；MJPEG/JPEG 相机不供流）。凭据可选（`username`/`password`，空 = 局域网开放；同时设置后启用 Basic/Digest 鉴权，地址写 `rtsp://user:pass@<NVR-IP>:8554/<camera_id>`）。Docker 部署需发布端口（`-p 8554:8554`）；端口被占仅记录错误，不影响主服务。接入 Home Assistant 见 [接入 Home Assistant](./home-assistant.md)。
+- **说明**： 内置 RTSP 输出服务端——每路相机一个固定取流地址 `rtsp://<NVR-IP>:8554/<camera_id>`，第三方平台（如群晖 Surveillance Station）可直接填为摄像头源。H.264/H.265 原生输出（无转码）；带 G.711 音频的相机额外输出一路音轨（`trackID=1`，PCMU payload type 0 / PCMA payload type 8，8 kHz 单声道），无音频的相机保持纯视频；Opus 不通过 RTSP 输出。凭据可选（`username`/`password`，空 = 局域网开放；同时设置后启用 Basic/Digest 鉴权，地址写 `rtsp://user:pass@<NVR-IP>:8554/<camera_id>`）。Docker 部署需发布端口（`-p 8554:8554`）；端口被占仅记录错误，不影响主服务。接入 Home Assistant 见 [接入 Home Assistant](./home-assistant.md)。
 - **示例**： 见[子码流 · RTSP 输出](sub-stream.md#rtsp-输出第三方平台取流)
 
 ### `server.substream.idle_timeout_s` / `server.substream.ready_timeout_s`

@@ -64,6 +64,20 @@ curl -u admin:password \
   -o audio-stream.aac
 ```
 
+## RTSP Output
+
+Cameras with G.711 audio also expose it on the built-in RTSP output server, so
+third-party platforms (Synology Surveillance Station etc.) ingest sound together
+with the picture:
+
+- The SDP carries a second media, `trackID=1`, on top of the video media.
+- Codec: PCMU (RFC 3551 static payload type 0) for μ-law cameras, PCMA
+  (payload type 8) for A-law cameras — 8000 Hz, mono, no transcoding. The law is
+  detected per camera, so nothing needs configuring.
+- Audio and video timestamps share one clock origin per stream; players sync the
+  tracks without extra signalling.
+- Cameras without G.711 keep a video-only SDP, and Opus is not emitted over RTSP.
+
 ## Two-Way Talk
 
 ### Enable Talk

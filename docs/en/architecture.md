@@ -205,7 +205,7 @@ flowchart LR
 
 ### 7.1 Overview
 
-Audio flows from camera capture through dual paths: recording (MP4 segments stored on disk) and live preview (real-time WebSocket streaming to the browser). The pipeline supports multiple audio codecs: G.711 μ-law and A-law (8-bit logarithmic PCM), AAC (MPEG-4 Audio), and Opus. Raw encoded bytes from the camera are written simultaneously to both paths without transcoding, preserving audio quality while minimizing server CPU load.
+Audio flows from camera capture through three paths: recording (MP4 segments stored on disk), live preview (real-time WebSocket streaming to the browser), and the built-in RTSP output server (G.711 only, re-served as a second RTP media). The pipeline supports multiple audio codecs: G.711 μ-law and A-law (8-bit logarithmic PCM), AAC (MPEG-4 Audio), and Opus. Raw encoded bytes from the camera are written simultaneously to every path without transcoding, preserving audio quality while minimizing server CPU load.
 
 ### 7.2 Codec Detection
 
@@ -224,13 +224,15 @@ The detection phase sets three critical fields on the recorder:
 
 ### 7.3 Dual-Path Architecture
 
-Raw encoded bytes from the camera RTP packets are written to TWO consumers simultaneously via the StreamHub frame bus:
+Raw encoded bytes from the camera RTP packets are fanned out to every live consumer via the StreamHub frame bus:
 
 1. **Recording path**: `muxer.WriteAudioSample(pts, codec, bytes)` → raw bytes stored in MP4 segment. MP4 box types vary by codec: `ulaw`/`alaw` (G.711, 8-bit sample size), `mp4a`+`esds` (AAC with AudioSpecificConfig), `Opus`+`dOps` (Opus with OpusHead, 48kHz timescale). NO transcoding occurs — raw codec data passes through unchanged.
 
 2. **Live preview path**: `hub.BroadcastAudio(pts, codec, sampleRate, bytes)` → wsstream → WebSocket binary frames → frontend JS decode.
 
-The critical insight: the SAME raw bytes go to both paths. The difference in audio quality between recording playback and live preview comes from the DECODER, not the data. Recording playback uses the browser's native MP4 audio decoder (highly optimized native code), while live preview uses JavaScript lookup tables + Web Audio API (requires correct tables and sample rate matching).
+3. **RTSP output path**: `hub.SubscribeAudio` → `rtplpcm.Encoder` (8-bit) → per-reader RTP on media `trackID=1`, declared as PCMU (payload type 0) or PCMA (payload type 8) at 8000 Hz mono. Video and audio timestamps derive from one wallclock origin per stream, so pullers (Synology Surveillance Station etc.) sync the two tracks without extra signalling. Only G.711 is emitted: Opus would have to be re-declared at 48 kHz while Xiaomi sends 16 kHz, and raw PCM (MISS codec 1024) is declined because it is not companded. Cameras without G.711 keep a video-only SDP.
+
+The critical insight: the SAME raw bytes go to every path. The difference in audio quality between recording playback and live preview comes from the DECODER, not the data. Recording playback uses the browser's native MP4 audio decoder (highly optimized native code), while live preview uses JavaScript lookup tables + Web Audio API (requires correct tables and sample rate matching).
 
 ### 7.4 Recording Playback (Clean Audio)
 
