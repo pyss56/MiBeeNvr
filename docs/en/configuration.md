@@ -217,7 +217,7 @@ version: "1.0"
 ### `server.rtsp.enabled` / `server.rtsp.port`
 - **Type**: bool / int
 - **Default**: `true` / `8554`
-- **Description**: Built-in RTSP output server — every camera gets a stable pull URL `rtsp://<NVR-IP>:8554/<camera_id>` that third-party platforms (e.g. Synology Surveillance Station) can use directly as a camera source. H.264/H.265 served natively (no transcoding, video only; MJPEG/JPEG cameras are not served). Credentials optional (`username`/`password`; empty = open on the LAN; setting both enables Basic/Digest auth — URL becomes `rtsp://user:pass@<NVR-IP>:8554/<camera_id>`). Docker deployments must publish the port (`-p 8554:8554`); a bind failure only logs an error — the rest of the NVR keeps working. See [Home Assistant Integration](./home-assistant.md).
+- **Description**: Built-in RTSP output server — every camera gets a stable pull URL `rtsp://<NVR-IP>:8554/<camera_id>` that third-party platforms (e.g. Synology Surveillance Station) can use directly as a camera source. H.264/H.265 served natively (no transcoding); cameras with G.711 audio get a second media (`trackID=1`) carrying PCMU (payload type 0) or PCMA (8) at 8 kHz mono, while cameras without it stay video-only. Opus audio is not emitted over RTSP. Credentials optional (`username`/`password`; empty = open on the LAN; setting both enables Basic/Digest auth — URL becomes `rtsp://user:pass@<NVR-IP>:8554/<camera_id>`). Docker deployments must publish the port (`-p 8554:8554`); a bind failure only logs an error — the rest of the NVR keeps working. See [Home Assistant Integration](./home-assistant.md).
 - **See**: [Sub-streams · RTSP output](sub-stream.md#rtsp-output-third-party-platforms)
 
 ### `server.substream.idle_timeout_s` / `server.substream.ready_timeout_s`

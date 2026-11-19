@@ -133,7 +133,7 @@ cd MiBeeNvr && make build
 | WebRTC（WHEP） | NVR → 观看端 | 亚秒延迟 |
 | HTTP-FLV | NVR → 观看端 | 浏览器友好 |
 | DLNA / UPnP AV | NVR → 电视 | 局域网媒体服务器——电视直接浏览播放录像库 |
-| RTSP（输出服务） | NVR → 外部 | 每台相机一个地址 `rtsp://<nvr>:8554/<camera-id>` |
+| RTSP（输出服务） | NVR → 外部 | 每台相机一个地址 `rtsp://<nvr>:8554/<camera-id>`，视频之外按需附带 G.711（PCMU/PCMA）音轨 |
 | RTMP / RTSP（转推） | NVR → 外部 | 原生 Go 转推至远端目标 |
 
 ## 文档

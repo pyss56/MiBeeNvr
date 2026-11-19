@@ -1,9 +1,16 @@
 // Package rtsp implements the built-in RTSP output server (#522): the NVR
 // serves rtsp://<host>:<port>/<camera_id> pull URLs so third-party platforms
 // (Synology Surveillance Station etc.) can ingest cameras directly, without a
-// MediaMTX intermediary (#499). PLAY direction only, video-only H.264/H.265
-// natively (no transcoding), frames tapped from the recorders' StreamHub —
-// the same source the FLV/HLS/WS live endpoints consume.
+// MediaMTX intermediary (#499). PLAY direction only, H.264/H.265 video plus an
+// optional G.711 audio track, served natively (no transcoding), frames tapped
+// from the recorders' StreamHub — the same source the FLV/HLS/WS live endpoints
+// consume.
+//
+// Audio: recorders that expose G.711 (Xiaomi PCMA/PCMU) get a second media in
+// the SDP (trackID=1). Video and audio timestamps both derive from the same
+// per-stream wallclock origin, so players sync them without extra signalling.
+// Opus and other codecs are not emitted here yet (gortsplib's Opus format is
+// 48 kHz-only while Xiaomi sends 16 kHz).
 package rtsp
 
 import (
@@ -43,6 +50,13 @@ type StreamInfo struct {
 	PPS   []byte
 	VPS   []byte // H.265 only
 	Hub   *streamhub.StreamHub
+
+	// AudioCodec is the recorder's live audio codec. Empty means "no audio
+	// track": the SDP then carries video only, exactly as before. Today only
+	// G.711 is emitted (model.AudioG711); Opus is ignored.
+	AudioCodec model.AudioCodec
+	// AudioMULaw selects PCMU (true) vs PCMA (false) for G.711.
+	AudioMULaw bool
 }
 
 // Ready reports whether the stream has everything needed to build an SDP.
@@ -86,6 +100,12 @@ type rtpEncoder interface {
 	Encode(au [][]byte) ([]*rtp.Packet, error)
 }
 
+// audioRTPEncoder abstracts rtplpcm.Encoder (G.711): its input is a flat slice
+// of encoded samples, not the video-style AU (slice of NALs).
+type audioRTPEncoder interface {
+	Encode(samples []byte) ([]*rtp.Packet, error)
+}
+
 // mjpegAUEncoder adapts rtpmjpeg.Encoder (single image) onto the AU-shaped
 // rtpEncoder contract: MJPEG AUs are one-element slices holding a whole JPEG.
 type mjpegAUEncoder struct {
@@ -107,6 +127,9 @@ func (m *mjpegAUEncoder) Encode(au [][]byte) ([]*rtp.Packet, error) {
 type rtspReader struct {
 	stream *gortsplib.ServerStream
 	media  *description.Media
+	// aMedia is the reader's audio track; nil when the camera has no G.711
+	// audio or the reader never SETUPs it.
+	aMedia *description.Media
 	// seq numbers this reader's stream emits. gortsplib sends the packet's
 	// own SequenceNumber (assigned by the shared encoder at Encode time), so
 	// without per-reader renumbering a replayed GOP (old seqs) followed by
@@ -115,7 +138,8 @@ type rtspReader struct {
 	// the header and renumbering per reader also keeps one stream's SSRC
 	// rewrite (gortsplib mutates pkt.SSRC per stream) from clobbering the
 	// shared packet other readers are writing.
-	seq uint16
+	seq  uint16
+	aSeq uint16 // audio track sequence, independent of the video one
 	// active flips in OnPlay; frames are only written to PLAYing readers —
 	// a SETUP→TEARDOWN without PLAY must not receive or hold traffic.
 	active bool
@@ -159,6 +183,14 @@ type cameraStream struct {
 	media  *description.Media
 	enc    rtpEncoder
 
+	// Optional G.711 audio track. audioEnc/aMedia stay nil when the camera
+	// exposes no G.711 audio; the SDP is then video-only as before.
+	audioCodec model.AudioCodec
+	audioMULaw bool
+	aMedia     *description.Media
+	audioEnc   audioRTPEncoder
+	audioSubID string
+
 	// rmu guards readers/gop. deliver takes the read side; reader
 	// attach/activate/detach take the write side.
 	rmu         sync.RWMutex
@@ -168,10 +200,13 @@ type cameraStream struct {
 	gop      []gopEntry
 	gopBytes int
 
-	// tsOrigin is the IngestAt (unix ns) of the first delivered frame; RTP
-	// timestamps derive from it at 90 kHz. Recorder hubs carry heterogeneous
-	// pts units, so the hub-entry wallclock is the only consistent clock.
-	tsOrigin int64
+	// tsOrigin is the wallclock (unix ns) of the first delivered frame; both
+	// the video (90 kHz) and audio (8 kHz) RTP timestamps derive from it, so
+	// the two tracks share one clock and players sync them without hints.
+	// Recorder hubs carry heterogeneous pts units, so the hub-entry wallclock
+	// is the only consistent basis. Atomic: video and audio arrive on separate
+	// hub goroutines.
+	tsOrigin atomic.Int64
 	// readers counts PLAYing sessions. Encoding is skipped at zero readers —
 	// keeps an idle subscribed camera at one atomic load per frame.
 	readers atomic.Int64
@@ -186,10 +221,7 @@ func (cs *cameraStream) deliver(m model.FrameMsg) {
 	if at <= 0 {
 		at = time.Now().UnixNano()
 	}
-	if cs.tsOrigin == 0 {
-		cs.tsOrigin = at
-	}
-	ts := uint32(((at - cs.tsOrigin) / 1000) * 9 / 1000) // ns → 90 kHz
+	ts := cs.rtpTS(at, 9) // ns → 90 kHz
 	pkts, err := cs.enc.Encode(m.AU)
 	if err != nil {
 		rtspLogger.Warn("rtsp encode failed", "camera_id", cs.cameraID, "error", err)
@@ -261,6 +293,51 @@ func (cs *cameraStream) deliver(m model.FrameMsg) {
 	cs.rmu.Unlock()
 }
 
+// rtpTS converts a wallclock stamp to RTP ticks at rate kHz, anchored at the
+// stream's first frame. rate is 9 for 90 kHz video and 8 for 8 kHz G.711 audio,
+// so both tracks share one clock and players sync them without hints.
+func (cs *cameraStream) rtpTS(at int64, rate int64) uint32 {
+	if cs.tsOrigin.Load() == 0 {
+		cs.tsOrigin.CompareAndSwap(0, at)
+	}
+	o := cs.tsOrigin.Load()
+	if at <= o {
+		return 0
+	}
+	return uint32(((at - o) / 1000) * rate / 1000)
+}
+
+// deliverAudio fans one G.711 frame out to every PLAYing reader's audio track.
+// The recorder's own pts is ignored on purpose: its unit differs per recorder,
+// while the hub-entry wallclock keeps audio on the same clock as video.
+func (cs *cameraStream) deliverAudio(_ int64, _ model.AudioCodec, data []byte) {
+	if cs.closed.Load() || cs.readers.Load() == 0 || cs.audioEnc == nil {
+		return
+	}
+	pkts, err := cs.audioEnc.Encode(data)
+	if err != nil {
+		rtspLogger.Warn("rtsp audio encode failed", "camera_id", cs.cameraID, "error", err)
+		return
+	}
+	ts := cs.rtpTS(time.Now().UnixNano(), 8) // ns → 8 kHz
+	for _, p := range pkts {
+		p.Timestamp = ts
+	}
+	cs.rmu.RLock()
+	for _, rs := range cs.sessReaders {
+		if !rs.active || rs.aMedia == nil {
+			continue
+		}
+		for _, p := range pkts {
+			if err := rs.writeAudio(p); err != nil {
+				rtspLogger.Warn("rtsp audio write failed", "camera_id", cs.cameraID, "error", err)
+				break
+			}
+		}
+	}
+	cs.rmu.RUnlock()
+}
+
 // writeParamSets pushes the camera's cached parameter sets as their own AU.
 // Cheap (three small NALs → one aggregation packet) and idempotent for
 // decoders when the following AU also carries them in-band.
@@ -308,6 +385,18 @@ func (rs *rtspReader) write(pkt *rtp.Packet) error {
 	return rs.stream.WritePacketRTP(rs.media, &c)
 }
 
+// writeAudio is write() for the reader's audio track: it renumbers on aSeq and
+// targets aMedia, so the two tracks keep independent RTP sequences.
+func (rs *rtspReader) writeAudio(pkt *rtp.Packet) error {
+	if rs.aMedia == nil {
+		return nil
+	}
+	c := *pkt
+	c.SequenceNumber = rs.aSeq
+	rs.aSeq++
+	return rs.stream.WritePacketRTP(rs.aMedia, &c)
+}
+
 func pktBytes(pkts []*rtp.Packet) int {
 	n := 0
 	for _, p := range pkts {
@@ -318,17 +407,44 @@ func pktBytes(pkts []*rtp.Packet) int {
 
 // addReader creates the session's private stream (own SDP, same params as the
 // template). Inactive until PLAY.
+//
+// Idempotent per session: a client SETUPs each media (video, then audio) in
+// separate requests, and every SETUP lands here. Returning the existing
+// reader keeps both tracks bound to ONE ServerStream — creating a second one
+// would leave the first unclosed and split the session across two streams.
 func (cs *cameraStream) addReader(sess *gortsplib.ServerSession) (*rtspReader, error) {
+	cs.rmu.Lock()
+	if rs, ok := cs.sessReaders[sess]; ok {
+		cs.rmu.Unlock()
+		return rs, nil
+	}
+	cs.rmu.Unlock()
+
 	media, err := cs.buildMedia()
 	if err != nil {
 		return nil, err
 	}
-	stream := &gortsplib.ServerStream{Server: cs.stream.Server, Desc: &description.Session{Medias: []*description.Media{media}}}
+	amedia, err := cs.buildAudioMedia()
+	if err != nil {
+		return nil, err
+	}
+	medias := []*description.Media{media}
+	if amedia != nil {
+		medias = append(medias, amedia)
+	}
+	stream := &gortsplib.ServerStream{Server: cs.stream.Server, Desc: &description.Session{Medias: medias}}
 	if err := stream.Initialize(); err != nil {
 		return nil, err
 	}
-	rs := &rtspReader{stream: stream, media: media, seq: uint16(rand.Uint32())}
+	rs := &rtspReader{stream: stream, media: media, aMedia: amedia, seq: uint16(rand.Uint32()), aSeq: uint16(rand.Uint32())}
+
 	cs.rmu.Lock()
+	if exist, ok := cs.sessReaders[sess]; ok {
+		// Lost the race with a concurrent SETUP: keep the winner, drop ours.
+		cs.rmu.Unlock()
+		stream.Close()
+		return exist, nil
+	}
 	cs.sessReaders[sess] = rs
 	cs.rmu.Unlock()
 	return rs, nil
@@ -469,6 +585,9 @@ func (s *Server) Stop() error {
 func (s *Server) teardownStream(cs *cameraStream) {
 	cs.closed.Store(true)
 	cs.hub.Unsubscribe(cs.subID)
+	if cs.audioSubID != "" {
+		cs.hub.UnsubscribeAudio(cs.audioSubID)
+	}
 	cs.closeReaders()
 	cs.stream.Close()
 }
@@ -517,6 +636,15 @@ func (s *Server) streamFor(cameraID string) *cameraStream {
 			delete(s.streams, cameraID)
 			rtspLogger.Info("rtsp stream rebuilt (recorder restart)",
 				"camera_id", cameraID, "codec", string(info.Codec))
+		case cs.audioCodec != info.AudioCodec || cs.audioMULaw != info.AudioMULaw:
+			// Audio appeared (or changed law) after the stream was built: the
+			// SDP must gain/lose trackID=1, so rebuild and let readers
+			// re-DESCRIBE. Happens on first audio packet of a freshly started
+			// recorder (codec id unknown at DESCRIBE time).
+			s.teardownStream(cs)
+			delete(s.streams, cameraID)
+			rtspLogger.Info("rtsp stream rebuilt (audio codec change)",
+				"camera_id", cameraID, "audio", string(info.AudioCodec))
 		case !bytes.Equal(cs.sps, info.SPS) || !bytes.Equal(cs.pps, info.PPS) || !bytes.Equal(cs.vps, info.VPS):
 			// Parameter-set change (e.g. camera resolution switch): reload the
 			// description without disconnecting readers.
@@ -535,6 +663,8 @@ func (s *Server) streamFor(cameraID string) *cameraStream {
 		vps:         bytes.Clone(info.VPS),
 		hub:         info.Hub,
 		subID:       "rtsp-" + cameraID,
+		audioCodec:  info.AudioCodec,
+		audioMULaw:  info.AudioMULaw,
 		sessReaders: make(map[*gortsplib.ServerSession]*rtspReader),
 	}
 
@@ -543,9 +673,16 @@ func (s *Server) streamFor(cameraID string) *cameraStream {
 		rtspLogger.Error("rtsp media init failed", "camera_id", cameraID, "error", err)
 		return nil
 	}
-	desc := &description.Session{
-		Medias: []*description.Media{media},
+	amedia, err := cs.buildAudioMedia()
+	if err != nil {
+		rtspLogger.Error("rtsp audio media init failed", "camera_id", cameraID, "error", err)
+		return nil
 	}
+	medias := []*description.Media{media}
+	if amedia != nil {
+		medias = append(medias, amedia)
+	}
+	desc := &description.Session{Medias: medias}
 	stream := &gortsplib.ServerStream{Server: s.gs, Desc: desc}
 	if err := stream.Initialize(); err != nil {
 		rtspLogger.Error("rtsp stream init failed", "camera_id", cameraID, "error", err)
@@ -553,15 +690,27 @@ func (s *Server) streamFor(cameraID string) *cameraStream {
 	}
 	cs.stream = stream
 	cs.media = media
+	cs.aMedia = amedia
 
 	if err := info.Hub.SubscribeMsg(cs.subID, func(m model.FrameMsg) { cs.deliver(m) }); err != nil {
 		stream.Close()
 		rtspLogger.Error("rtsp hub subscribe failed", "camera_id", cameraID, "error", err)
 		return nil
 	}
+	if amedia != nil {
+		cs.audioSubID = "rtsp-audio-" + cameraID
+		if err := info.Hub.SubscribeAudio(cs.audioSubID,
+			func(pts int64, codec model.AudioCodec, data []byte) { cs.deliverAudio(pts, codec, data) }); err != nil {
+			stream.Close()
+			info.Hub.Unsubscribe(cs.subID)
+			rtspLogger.Error("rtsp audio subscribe failed", "camera_id", cameraID, "error", err)
+			return nil
+		}
+	}
 
 	s.streams[cameraID] = cs
-	rtspLogger.Info("rtsp stream serving", "camera_id", cameraID, "codec", string(info.Codec))
+	rtspLogger.Info("rtsp stream serving", "camera_id", cameraID,
+		"codec", string(info.Codec), "audio", string(info.AudioCodec))
 	return cs
 }
 
@@ -617,6 +766,38 @@ func (cs *cameraStream) buildMedia() (*description.Media, error) {
 		Type:    description.MediaTypeVideo,
 		Control: "trackID=0",
 		Formats: []format.Format{forma},
+	}, nil
+}
+
+// buildAudioMedia constructs the optional G.711 audio media (trackID=1) and, on
+// first call, the shared audio RTP encoder. Returns nil when the camera exposes
+// no G.711 audio — the SDP then stays video-only, exactly as before.
+func (cs *cameraStream) buildAudioMedia() (*description.Media, error) {
+	if cs.audioCodec != model.AudioG711 {
+		return nil, nil
+	}
+	f := &format.G711{
+		MULaw:        cs.audioMULaw,
+		SampleRate:   8000,
+		ChannelCount: 1,
+	}
+	// RFC 3551 static payload types: 0 = PCMU (mu-law), 8 = PCMA (A-law).
+	if cs.audioMULaw {
+		f.PayloadTyp = 0
+	} else {
+		f.PayloadTyp = 8
+	}
+	if cs.audioEnc == nil {
+		enc, err := f.CreateEncoder()
+		if err != nil {
+			return nil, err
+		}
+		cs.audioEnc = enc
+	}
+	return &description.Media{
+		Type:    description.MediaTypeAudio,
+		Control: "trackID=1",
+		Formats: []format.Format{f},
 	}, nil
 }
 

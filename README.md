@@ -133,7 +133,7 @@ See [Metrics & Monitoring](docs/en/metrics.md) and [Configuration → observabil
 | WebRTC (WHEP) | NVR → Viewer | Sub-second latency |
 | HTTP-FLV | NVR → Viewer | Browser-friendly streaming |
 | DLNA / UPnP AV | NVR → TV | LAN media server — TVs browse and play the recording library |
-| RTSP (output server) | NVR → External | Every camera re-served at `rtsp://<nvr>:8554/<camera-id>` |
+| RTSP (output server) | NVR → External | Every camera re-served at `rtsp://<nvr>:8554/<camera-id>`, video plus an optional G.711 (PCMU/PCMA) audio track |
 | RTMP / RTSP (relay) | NVR → External | Native Go push-out to remote targets |
 
 ## Documentation
