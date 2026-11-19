@@ -61,8 +61,14 @@ jobs:
           EXTRA_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          # Version: nearest v* tag if reachable, else v<short-sha> (fork has no tags yet).
-          VER=$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null || echo "")
+          # Version: fork-local VERSION file wins (4-part fork numbering,
+          # e.g. v0.15.0.1), then an exact tag, then v<short-sha>.
+          # The file is fork-only; upstream syncs never touch it, and bumping
+          # the build number is a one-line edit here (no tag push, which would
+          # wake upstream's release.yml).
+          VER=""
+          if [ -f VERSION ]; then VER=$(tr -d ' \t\r\n' < VERSION); fi
+          [ -n "$VER" ] || VER=$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null || echo "")
           [ -n "$VER" ] || VER="v$(git rev-parse --short=12 HEAD)"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $VER"
