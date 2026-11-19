@@ -295,6 +295,25 @@ func (r *XiaomiRecorder) AudioCodec() string {
 // AudioConfig returns the audio codec config. G.711 returns nil (no ASC).
 func (r *XiaomiRecorder) AudioConfig() []byte { return nil }
 
+// AudioG711 reports the live G.711 variant so a live RTP consumer can pick the
+// right static payload type: (true, true) for PCMU (mu-law, codec 1026),
+// (false, true) for PCMA (A-law, codec 1027).
+//
+// ok is false for anything that cannot be carried verbatim as PCMU/PCMA — Opus,
+// and also raw PCM (codec 1024): the hub labels the latter "g711" for the
+// recording path, but it is 16-bit linear audio, so advertising it as an 8-bit
+// G.711 track would emit noise.
+func (r *XiaomiRecorder) AudioG711() (muLaw bool, ok bool) {
+	switch r.audioCodecID.Load() {
+	case missCodecPCMU:
+		return true, true
+	case missCodecPCMA:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // AudioSampleRate returns the audio sample rate. G.711 defaults to 8 kHz.
 func (r *XiaomiRecorder) AudioSampleRate() int {
 	if _, ok := missCodecToAudio(r.audioCodecID.Load()); ok {

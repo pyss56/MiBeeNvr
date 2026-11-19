@@ -48,7 +48,7 @@ sequenceDiagram
 | WS | `stream/ws?quality=` | frame push | viewer counts sum both hub keys (main+sub) |
 | FLV | `stream.flv?quality=` | GOP cache fast-start | slow clients never block the hub (writes outside the lock with timeout) |
 | HLS | path form `/stream/{sub,}/index.m3u8` | low-latency mode is tri-state; `stream.m3u8` alias rewriting | unknown names 404 instead of an empty 200 playlist |
-| RTSP | `rtsp://host:8554/<camid>` | per-reader streams with re-sequenced RTP; hot SDP parameter-set reload | joining mid-GOP warns until the next IDR (open GOPs) |
+| RTSP | `rtsp://host:8554/<camid>` | per-reader streams with re-sequenced RTP; hot SDP parameter-set reload; optional G.711 audio as a second media (trackID=1, PCMU/PCMA, shared 8 kHz clock origin with video) | joining mid-GOP warns until the next IDR (open GOPs) |
 | WHEP | WebRTC endpoint | H.264 only; H.265 sub → fallback | sessions bucketed per stream key |
 
 ## 4. Quality negotiation (SPA side)

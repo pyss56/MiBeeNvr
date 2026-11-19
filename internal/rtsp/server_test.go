@@ -9,6 +9,7 @@ package rtsp
 import (
 	"context"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
 
 	"github.com/Mi-Bee-Studio/MiBeeNvr/internal/model"
@@ -39,15 +41,27 @@ var (
 
 type testServer struct {
 	*Server
-	t       *testing.T
-	url     string
-	hub     *streamhub.StreamHub
-	codec   model.Format
-	sps     []byte
-	pps     []byte
+	t     *testing.T
+	url   string
+	hub   *streamhub.StreamHub
+	codec model.Format
+	sps   []byte
+	pps   []byte
+	// audio drives the optional G.711 track; nil (the default) keeps the SDP
+	// video-only, the pre-audio behaviour. Atomic: tests arm it while the
+	// server's provider closure reads it from RTSP handler goroutines.
+	audio   atomic.Pointer[testAudio]
 	known   atomic.Bool
 	stopped chan struct{}
 }
+
+// testAudio is one armed audio track: G.711 with the given law.
+type testAudio struct {
+	muLaw bool
+}
+
+// setAudio arms (or with nil clears) the optional G.711 track.
+func (ts *testServer) setAudio(a *testAudio) { ts.audio.Store(a) }
 
 // startTestServer boots an RTSP server on an ephemeral port with an injectable
 // provider whose responses the test can mutate.
@@ -74,7 +88,12 @@ func startTestServer(t *testing.T, cfg Config) *testServer {
 		if cameraID != "cam-1" || !ts.known.Load() {
 			return StreamInfo{}, false
 		}
-		return StreamInfo{Codec: ts.codec, SPS: ts.sps, PPS: ts.pps, VPS: tVPS, Hub: ts.hub}, true
+		info := StreamInfo{Codec: ts.codec, SPS: ts.sps, PPS: ts.pps, VPS: tVPS, Hub: ts.hub}
+		if a := ts.audio.Load(); a != nil {
+			info.AudioCodec = model.AudioG711
+			info.AudioMULaw = a.muLaw
+		}
+		return info, true
 	})
 	go func() {
 		_ = ts.Server.Start(context.Background())
@@ -211,6 +230,113 @@ func TestRTSPServeH265(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no H265 RTP packet received")
 	}
+}
+
+// G.711 cameras gain a second SDP media (trackID=1) carrying the RFC 3551
+// static payload type that matches the law. Video-only cameras stay at one
+// media, as asserted by TestRTSPServeAndPullH264.
+func TestRTSPDescribeG711Audio(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		muLaw     bool
+		wantPT    uint8
+		wantCodec string
+	}{
+		{"mu-law (PCMU)", true, 0, "PCMU"},
+		{"A-law (PCMA)", false, 8, "PCMA"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := startTestServer(t, Config{})
+			ts.setAudio(&testAudio{muLaw: tc.muLaw})
+
+			c := dialClient(t, ts.url)
+			desc, _, err := c.Describe(mustURL(t, ts.url))
+			require.NoError(t, err)
+			require.Len(t, desc.Medias, 2, "G.711 camera must advertise video + audio")
+			require.Equal(t, description.MediaTypeVideo, desc.Medias[0].Type)
+
+			av := desc.Medias[1]
+			require.Equal(t, description.MediaTypeAudio, av.Type)
+			require.Equal(t, "trackID=1", av.Control)
+			require.Len(t, av.Formats, 1)
+			f, ok := av.Formats[0].(*format.G711)
+			require.True(t, ok, "audio format must be G.711, got %T", av.Formats[0])
+			require.Equal(t, tc.wantPT, f.PayloadTyp)
+			require.Equal(t, tc.muLaw, f.MULaw)
+			require.Equal(t, 8000, f.SampleRate)
+			require.Equal(t, 1, f.ChannelCount)
+			require.Equal(t, tc.wantCodec, strings.SplitN(f.RTPMap(), "/", 2)[0])
+		})
+	}
+}
+
+// The audio track must actually carry hub frames once a client SETUPs it —
+// and only on the audio media, with the negotiated static payload type.
+func TestRTSPAudioTrackDeliversG711(t *testing.T) {
+	ts := startTestServer(t, Config{})
+	ts.setAudio(&testAudio{muLaw: true})
+
+	c := dialClient(t, ts.url)
+	desc, _, err := c.Describe(mustURL(t, ts.url))
+	require.NoError(t, err)
+	require.Len(t, desc.Medias, 2)
+
+	_, err = c.Setup(desc.BaseURL, desc.Medias[0], 0, 0)
+	require.NoError(t, err)
+	_, err = c.Setup(desc.BaseURL, desc.Medias[1], 0, 0)
+	require.NoError(t, err)
+
+	audioPkts := make(chan *rtp.Packet, 16)
+	c.OnPacketRTP(desc.Medias[1], desc.Medias[1].Formats[0], func(pkt *rtp.Packet) {
+		select {
+		case audioPkts <- pkt:
+		default:
+		}
+	})
+	_, err = c.Play(nil)
+	require.NoError(t, err)
+
+	// A 20 ms G.711 frame (160 samples) fits one RTP packet, so payload and
+	// timestamp checks are exact.
+	frame := make([]byte, 160)
+	for i := range frame {
+		frame[i] = byte(i)
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		ts.hub.BroadcastAudio(0, model.AudioG711, frame)
+		select {
+		case p := <-audioPkts:
+			require.Equal(t, uint8(0), p.PayloadType, "PCMU static payload type")
+			require.Equal(t, frame, p.Payload)
+			require.NotZero(t, p.SSRC)
+			return
+		case <-time.After(200 * time.Millisecond):
+			select {
+			case <-deadline:
+				t.Fatal("no audio RTP packet received within 5s")
+			default:
+			}
+		}
+	}
+}
+
+// A recorder whose audio codec is only discovered after the first audio packet
+// (Xiaomi: codec id unknown at DESCRIBE time) must rebuild the stream so the
+// SDP gains trackID=1 — otherwise pullers never negotiate audio.
+func TestRTSPAudioAppearsAfterStreamBuilt(t *testing.T) {
+	ts := startTestServer(t, Config{})
+	c := dialClient(t, ts.url)
+
+	desc, _, err := c.Describe(mustURL(t, ts.url))
+	require.NoError(t, err)
+	require.Len(t, desc.Medias, 1)
+
+	ts.setAudio(&testAudio{muLaw: false})
+	desc2, _, err := c.Describe(mustURL(t, ts.url))
+	require.NoError(t, err)
+	require.Len(t, desc2.Medias, 2, "late-discovered audio must be re-advertised")
+	require.Equal(t, uint8(8), desc2.Medias[1].Formats[0].(*format.G711).PayloadTyp)
 }
 
 // feedIDRBare pushes an IDR AU WITHOUT parameter sets — mirrors recorders

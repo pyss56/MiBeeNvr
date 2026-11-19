@@ -32,7 +32,7 @@
 | HTTP-FLV | 1–3s | 浏览器友好，长观看 |
 | HLS / LL-HLS | 2–5s | 兼容性优先，iOS 原生支持 |
 | WASM 播放器 | ~1s | **纯 HTTP 播放 H.265**，无需 HTTPS 与专用客户端 |
-| RTSP 输出 | 实时 | 第三方平台（群晖 Surveillance Station 等）直接取流，每机一址 `rtsp://<NVR-IP>:8554/<camera_id>`；v0.13 起支持 MJPEG/JPEG 相机（RTP-JPEG） |
+| RTSP 输出 | 实时 | 第三方平台（群晖 Surveillance Station 等）直接取流，每机一址 `rtsp://<NVR-IP>:8554/<camera_id>`；v0.13 起支持 MJPEG/JPEG 相机（RTP-JPEG）；G.711 相机额外带一路 PCMU/PCMA 音轨（无音频的相机保持纯视频） |
 
 - **H.265 全链路**：直播（WASM 软解 / WebCodecs 硬解自动择优）、录制、回放、延时摄影全面支持 H.265
 - **[子码流按需](sub-stream.md)**：宫格「流畅」模式走低分辨率子码流，无观看者自动停拉零成本；ONVIF 子流自动发现，取不到自动回退主码流

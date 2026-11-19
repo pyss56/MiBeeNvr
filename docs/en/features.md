@@ -32,7 +32,7 @@ Zero-touch onboarding: cameras still on a vendor-default subnet (Hikvision-famil
 | HTTP-FLV | 1–3s | Browser-friendly long watching |
 | HLS / LL-HLS | 2–5s | Compatibility first, native iOS support |
 | WASM player | ~1s | **H.265 playback over plain HTTP** — no HTTPS, no client app |
-| RTSP output | Real-time | Third-party platforms (Synology Surveillance Station etc.) pull directly — one URL per camera, `rtsp://<NVR-IP>:8554/<camera_id>`; as of v0.13 MJPEG/JPEG cameras too (RTP-JPEG) |
+| RTSP output | Real-time | Third-party platforms (Synology Surveillance Station etc.) pull directly — one URL per camera, `rtsp://<NVR-IP>:8554/<camera_id>`; as of v0.13 MJPEG/JPEG cameras too (RTP-JPEG); G.711 cameras add a PCMU/PCMA audio track (video-only when the camera has none) |
 
 - **End-to-end H.265**: live view (WASM software decode / WebCodecs hardware decode, auto-selected), recording, playback and timelapse all support H.265
 - **[On-demand sub-streams](sub-stream.md)**: the grid's "Smooth" mode rides the low-resolution sub-stream and stops pulling when nobody watches — zero idle cost; ONVIF sub-streams auto-discovered, silent fallback to main
