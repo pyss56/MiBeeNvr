@@ -207,6 +207,10 @@ type cameraStream struct {
 	// is the only consistent basis. Atomic: video and audio arrive on separate
 	// hub goroutines.
 	tsOrigin atomic.Int64
+	// audioClock is the running 8 kHz sample clock for the G.711 track; see
+	// audioTS. Atomic because the audio hub callback is its only writer but
+	// readers must not tear.
+	audioClock atomic.Uint32
 	// readers counts PLAYing sessions. Encoding is skipped at zero readers —
 	// keeps an idle subscribed camera at one atomic load per frame.
 	readers atomic.Int64
@@ -221,7 +225,7 @@ func (cs *cameraStream) deliver(m model.FrameMsg) {
 	if at <= 0 {
 		at = time.Now().UnixNano()
 	}
-	ts := cs.rtpTS(at, 9) // ns → 90 kHz
+	ts := cs.rtpTS(at, 90000) // ns → 90 kHz (the H.26x RTP clock)
 	pkts, err := cs.enc.Encode(m.AU)
 	if err != nil {
 		rtspLogger.Warn("rtsp encode failed", "camera_id", cs.cameraID, "error", err)
@@ -293,10 +297,13 @@ func (cs *cameraStream) deliver(m model.FrameMsg) {
 	cs.rmu.Unlock()
 }
 
-// rtpTS converts a wallclock stamp to RTP ticks at rate kHz, anchored at the
-// stream's first frame. rate is 9 for 90 kHz video and 8 for 8 kHz G.711 audio,
-// so both tracks share one clock and players sync them without hints.
-func (cs *cameraStream) rtpTS(at int64, rate int64) uint32 {
+// rtpTS converts a wallclock stamp to RTP ticks at hz, anchored at the stream's
+// first frame. hz is the clock rate the SDP declares — 90000 for H.264/H.265,
+// 8000 for G.711 — so both tracks share one clock and players sync them without
+// hints. The rate must be the full Hz value: an earlier version scaled by Hz/10
+// and produced 9000 ticks/s on a 90 kHz clock, which made every player render
+// the video ten times too slowly.
+func (cs *cameraStream) rtpTS(at, hz int64) uint32 {
 	if cs.tsOrigin.Load() == 0 {
 		cs.tsOrigin.CompareAndSwap(0, at)
 	}
@@ -304,7 +311,28 @@ func (cs *cameraStream) rtpTS(at int64, rate int64) uint32 {
 	if at <= o {
 		return 0
 	}
-	return uint32(((at - o) / 1000) * rate / 1000)
+	// Split into whole seconds and remainder so a multi-day stream cannot
+	// overflow int64 before the uint32 wrap that RTP expects.
+	d := at - o
+	sec := d / int64(time.Second)
+	rem := d % int64(time.Second)
+	return uint32(sec*hz + rem*hz/int64(time.Second))
+}
+
+// audioTS returns the 8 kHz sample clock for one G.711 frame and advances it by
+// the payload length (one byte per 8-bit sample). Consecutive frames therefore
+// stay strictly monotonic: wallclock stamps collide when the hub delivers two
+// frames within the same millisecond, which players report as a duplicated DTS.
+// The clock is anchored to tsOrigin on the first frame so audio starts in sync
+// with video even when the camera enables audio late.
+func (cs *cameraStream) audioTS(n int) uint32 {
+	if n <= 0 {
+		return cs.audioClock.Load()
+	}
+	if cs.audioClock.Load() == 0 {
+		cs.audioClock.CompareAndSwap(0, cs.rtpTS(time.Now().UnixNano(), 8000))
+	}
+	return cs.audioClock.Add(uint32(n)) - uint32(n)
 }
 
 // deliverAudio fans one G.711 frame out to every PLAYing reader's audio track.
@@ -319,7 +347,7 @@ func (cs *cameraStream) deliverAudio(_ int64, _ model.AudioCodec, data []byte) {
 		rtspLogger.Warn("rtsp audio encode failed", "camera_id", cs.cameraID, "error", err)
 		return
 	}
-	ts := cs.rtpTS(time.Now().UnixNano(), 8) // ns → 8 kHz
+	ts := cs.audioTS(len(data)) // 8 kHz sample clock, advances by payload
 	for _, p := range pkts {
 		p.Timestamp = ts
 	}
@@ -524,6 +552,12 @@ func NewServer(cfg Config, provider StreamProvider) *Server {
 	s.gs = &gortsplib.Server{
 		Handler:     s,
 		RTSPAddress: cfg.Addr,
+		// gortsplib's default write queue is 256 packets. A single 1080p
+		// keyframe is split into hundreds of RTP packets and the GOP replay
+		// on reader start pushes a whole GOP at once, so the default overflows
+		// ("write queue is full", packets silently dropped → frozen picture).
+		// 2048 absorbs the burst; the value must stay a power of two.
+		WriteQueueSize: 2048,
 	}
 	if cfg.ListenFn != nil {
 		s.gs.Listen = cfg.ListenFn
