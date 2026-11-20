@@ -240,33 +240,13 @@ func (cs *cameraStream) deliver(m model.FrameMsg) {
 		if !rs.active {
 			continue
 		}
-		// Fresh reader: replay the cached GOP so its decode starts at a GOP
-		// head. A keyframe arriving right now makes the replay redundant —
-		// the live AU alone is a clean start. Both rs flags are written only
-		// by this goroutine (the hub's single drain), so mutation under the
-		// read lock is race-free.
+		// New readers always start at the next live IDR (see activateReader).
+		// Inject parameter sets once with that IDR so pullers that ignore the
+		// SDP's sprop can decode it standalone.
 		injectParams := false
-		if rs.replayPending {
-			rs.replayPending = false
-			if !m.IsKeyframe && len(cs.gop) > 0 {
-				for i, e := range cs.gop {
-					if i == 0 {
-						// In-band parameter sets ahead of any picture data:
-						// pullers don't reliably consume the SDP's sprop, and
-						// hub AUs don't consistently carry params per-IDR
-						// (recorder-dependent) — without this a replayed GOP
-						// head decodes as reference-missing noise.
-						cs.writeParamSets(rs, e.ts)
-					}
-					cs.writePkts(rs, e.pkts)
-				}
-			} else {
-				injectParams = true // replay skipped; the live AU opens the stream
-			}
-		}
 		if rs.skipUntilIDR {
 			if !m.IsKeyframe {
-				continue // mid-GOP join with no replayable GOP: wait for the IDR
+				continue // mid-GOP join: wait for the IDR
 			}
 			rs.skipUntilIDR = false
 			injectParams = true
@@ -491,11 +471,14 @@ func (cs *cameraStream) activateReader(sess *gortsplib.ServerSession) {
 	if !ok || rs.active {
 		return
 	}
-	if len(cs.gop) > 0 {
-		rs.replayPending = true
-	} else {
-		rs.skipUntilIDR = true
-	}
+	// Always wait for the next IDR instead of replaying cs.gop. Cached GOP
+	// packets carry RTP timestamps stamped against an older timebase (a
+	// recorder reconnect builds a new hub/tsOrigin while the cache survives),
+	// so replaying them injects a multi-minute timestamp jump followed by a
+	// backward jump — HEVC decoders then lose their reference picture set
+	// ("Could not find ref with POC") and freeze on the first frame. Waiting
+	// for a live IDR (camera GOP is ~6s) guarantees a clean, monotonic start.
+	rs.skipUntilIDR = true
 	rs.active = true
 }
 

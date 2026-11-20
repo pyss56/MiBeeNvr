@@ -384,11 +384,12 @@ func firstNALType(t *testing.T, pkts <-chan *rtp.Packet, h265 bool) byte {
 	}
 }
 
-// Mid-GOP joins must start at the GOP head (#524 phase 2): the shared-stream
-// fan-out used to write mid-GOP P-frames to freshly attached readers, whose
-// decoders logged reference-missing warnings until the next IDR. Now each
-// reader gets the cached GOP replayed — the first packet a late joiner
-// receives belongs to the keyframe AU.
+// Mid-GOP joins must start at the next live IDR: the shared-stream fan-out
+// used to write mid-GOP P-frames to freshly attached readers, whose decoders
+// logged reference-missing warnings until the next IDR. A reader now stays
+// silent until a live IDR arrives (cached-GOP replay was removed because its
+// stale timestamps inject a multi-minute jump that breaks HEVC reference
+// sets); the first packet it receives belongs to the keyframe AU.
 func TestRTSPMidGOPJoinStartsAtKeyframe(t *testing.T) {
 	ts := startTestServer(t, Config{})
 
@@ -415,8 +416,8 @@ func TestRTSPMidGOPJoinStartsAtKeyframe(t *testing.T) {
 	// Let the GOP cache settle before the late join.
 	time.Sleep(100 * time.Millisecond)
 
-	// Reader B joins mid-GOP: its first packet must be the replayed GOP head
-	// (SPS/PPS/IDR), never a bare P-frame.
+	// Reader B joins mid-GOP: it must stay silent through P-frames and only
+	// start at the next live IDR (SPS/PPS/IDR), never a bare P-frame.
 	b := dialClient(t, ts.url)
 	descB, _, err := b.Describe(mustURL(t, ts.url))
 	require.NoError(t, err)
@@ -432,8 +433,15 @@ func TestRTSPMidGOPJoinStartsAtKeyframe(t *testing.T) {
 	_, err = b.Play(nil)
 	require.NoError(t, err)
 
-	// The replay rides the first post-PLAY frame — feed one to trigger it.
+	// A P-frame must NOT reach the fresh reader (no stale-GOP replay).
 	ts.feedP()
+	select {
+	case p := <-pktsB:
+		t.Fatalf("mid-GOP P-frame leaked to fresh reader (NAL %d): stale-GOP replay must stay disabled", p.Payload[0]&0x1F)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// The next live IDR is the clean start.
+	ts.feedIDR()
 
 	switch n := firstNALType(t, pktsB, false); n {
 	case 7, 8, 5: // SPS / PPS / IDR — GOP head AU
@@ -529,7 +537,8 @@ func TestRTSPJoinInjectsParamSets(t *testing.T) {
 	})
 	_, err = b.Play(nil)
 	require.NoError(t, err)
-	ts.feedIDRBare() // trigger the deferred replay
+	ts.feedP() // mid-GOP P-frame: fresh reader must stay silent
+	ts.feedIDRBare() // next live IDR triggers param-set injection + clean start
 
 	switch n := firstNALType(t, pktsB, true); n {
 	case 32, 33, 34, 48: // VPS/SPS/PPS or an aggregation carrying them
